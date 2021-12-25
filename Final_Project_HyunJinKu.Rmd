@@ -1,0 +1,267 @@
+---
+title: "Youtube trending video tag counts analysis, using Bayesian Data Analysis framework"
+author: "Hyun Jin Alicia Ku"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(rstanarm)
+library(brms)
+library(bayesplot)
+library(bayestestR)
+library(tidybayes)
+library(parameters)
+library(patchwork)
+library(magrittr)
+library(lubridate)
+library(broom)
+library(broom.mixed)
+library(ggbeeswarm)
+library(loo)
+library(emmeans)
+library(reshape2)
+library(dplyr)
+options(mc.cores = parallel::detectCores())
+set.seed(1766)
+```
+
+----Intro----  
+
+I wanted to choose a dataset that's interesting to me.
+My genuine interest is the digital advertising industry. I've actually done an internship during my freshman year, and I had an expose to the raw log data of the digital advertisements' performance. Recently, I've been spending a lot of time watching YouTube videos and thought maybe I should pick Youtube related dataset.
+
+My dataset is from Kaggle : "https://www.kaggle.com/sgonkaggle/youtube-trend-with-subscriber"
+
+Youtube has a list of top "trending videos" on its platform so that the user can conveniently explore its popular videos. They have their own algorithm on the selection of trending videos, which uses a combination of factors like user engagements (likes, comments, shares,
+and views) or number of tags that the publisher put. I wanted to research on what factor might influence how many days a video maintain being on trending list. 
+This is a modified version of Trending Youtube Video statistics, and it only contains the data for United States. 
+
+----Data Pre-processing----  
+
+Importing the dataset
+```{r}
+
+videos <- read_csv("C:/Users/alici/OneDrive/Desktop/COLLEGE/Bayesian/USvideos_modified.csv/USvideos_modified.csv")
+```
+
+removing duplicated rows
+```{r}
+videos[!duplicated(videos),]
+```
+
+factorizing some factor variables with levels
+```{r}
+videodata1 <- videos %>%
+mutate(publish_hour = factor(publish_hour)
+)
+videodata1 <- videos %>%
+mutate(category_id = factor(category_id)
+)
+```
+
+```{r}
+head(videodata1)
+nrow(videodata1) 
+```
+
+scaling tags_count and comment_count in a scale of mean : 0 and sd : 1
+```{r}
+videodata1<-videodata1 %>% mutate(tags_count_scaled = scale(tags_count))
+videodata1<-videodata1 %>% mutate(comment_count_scaled = scale(comment_count))
+```
+
+
+making a randomly sampled dataset with 3000 data points out of 4547 (because sometimes model runs for forever... even few hours)
+```{r}
+sampled_videodata1<-sample_n(videodata1,3000)
+nrow(sampled_videodata1)
+```
+
+
+
+----Analysis----  
+
+1. Building a model
+
+First, I wanted to see how trend_day_count differs depending on the category_id (how videos being in different category differ number of days that a video stay in trending) because I had a sense that category can be used as a grouping.
+```{r}
+videodata1 %>%
+ggplot(aes(tags_count_scaled, trend_day_count, color=factor(category_id))) + geom_point() +
+  geom_smooth(aes(color=factor(category_id)), method= "lm", se=FALSE) + geom_smooth(method="lm", se=FALSE, color="black", size = 1.5)
+
+```
+
+number of days on trending quite differs depending on what category the video is in.
+
+
+My model that uses trend_day_count as a response variable, and tags_count_scaled, comment_count_scaled, and the intercept
+```{r}
+video_fit<-stan_glmer(trend_day_count~tags_count_scaled+comment_count_scaled+(1|category_id), data=videodata1, chains=4,cores=4)
+```
+
+
+2. Posterior Analysis
+
+Trace plot
+```{r}
+plot(video_fit, plotfun="trace",pars=c("(Intercept)","tags_count_scaled","comment_count_scaled","sigma"))
+```
+
+The trace plots look good.
+
+
+posteriors with 90% equal tails credible intervals shown
+```{r}
+plot(video_fit,plotfun="areas",pars=c("(Intercept)","tags_count_scaled","comment_count_scaled","sigma"),prob=0.9)
+```
+
+```{r}
+describe_posterior(video_fit)
+
+```
+
+RHAT < 1.01, it's in acceptable range, meaning the chains are good
+
+
+pd for tag counts is lower than pd for other parameters. 
+I've read that in Instagram, putting too many tags won't work favorably for the exposure algorithm on other users. I wonder if that'd be true here.
+I'd like to break down the tags count into lowtag and high tag, and see how pd changes for those coefficients.
+--> I tried to further analyze on this from Appendix.
+
+
+posterior predictive test
+```{r}
+pp_check(video_fit, nreps=600)
+
+```
+
+not so good simulation, I believe there are other factors that affect the trending days count in general,
+such as facebook's unique algorithm or rules on trending videos? Not quite sure what could be. 
+
+
+Predictions
+```{r}
+point_estimate(video_fit)
+
+mean(videodata1$tags_count)
+sd(videodata1$tags_count)
+mean(videodata1$comment_count)
+sd(videodata1$comment_count)
+
+```
+
+Point estimates indicate that
+trend_day_count can be predicted by the equation
+
+trend_day_count = 4.89 - 0.09 * (tag count scaled) + 0.2 * (comment count scaled)
+
+X count scaled = (# of tags - mean of # of X)/sd of # of X
+
+So, for better understanding,
+trend_day_count = 4.89 - 0.09 * (# of tags - 19.20937)/12.45236 + 0.2 * (# of comments - 4938.788)/31101.22
+
+```{r}
+particular_set = sample_n(videodata1,30)
+predicted_trend_day_count = 4.89 - 0.09 * (particular_set$tags_count-19.20937)/12.45236 + 0.2*(particular_set$comment_count-4938.788)/31101.22
+data.frame (particular_set$tags_count, particular_set$comment_count, predicted_trend_day_count)
+
+```
+
+I used my model to make predictions of trend_day_count at particular set of predictor values above.
+
+Summary, n_eff
+```{r}
+summary(video_fit, digits=3)
+```
+
+some variables need effective sample size n_eff a little bigger than 5000
+--> I included chains=4 to make sure it satisfies
+
+
+
+----Appendix.----  
+
+From the analysis in my video_fit model, I've detected that the parameter for tags is negative, and the probability of direction was lower than other parameters.
+The parameter might act differently when it's small vs. when it's large.
+My guess is that number of tags might negatively affect y if tags counts are too large.
+
+I divide the tag count variable into high_tags and low_tags (if greater than the mean of tags count, it's considered high_tags, and if lower than the mean of tags count, it's low_tags.)
+I'll briefly go over the behavior of the model that includes low_tags and high_tags interacted with the tags count.
+
+```{r}
+
+n<-mean(videodata1$tags_count)
+
+videodata1<-videodata1 %>% mutate(
+  high_tags = (tags_count > n)
+)
+
+videodata1<-videodata1 %>% mutate(
+  low_tags = (tags_count < n)
+)
+
+head(videodata1$high_tags)
+head(videodata1$low_tags)
+```
+
+fitting a model with the interaction term and low_tags
+```{r}
+
+video_fit2<-stan_glmer(trend_day_count~comment_count_scaled+tags_count_scaled*low_tags+(1|category_id),data=videodata1,cores=4)
+```
+
+
+```{r}
+plot(video_fit2, plotfun="trace",pars= c("(Intercept)","low_tagsTRUE","tags_count_scaled","tags_count_scaled:low_tagsTRUE","sigma"))
+```
+
+chains are good
+
+```{r}
+model_parameters(video_fit2, ci=0.9) 
+```
+
+Good Rhat value (<1.01)
+tags_count_scaled:low_tagsTRUE has stronger pd than video_fit.
+
+
+```{r}
+plot(video_fit2,plotfun="areas",pars=c("(Intercept)","low_tagsTRUE","tags_count_scaled","tags_count_scaled:low_tagsTRUE","sigma"),prob=0.9)
+
+```
+
+when low_tag is TRUE (meaning the number of tags of the video is lower than the mean of 19.21), coefficient for tags_count_scaled actually positively affect the response variable, trending_days_count. This means that when there are less than 19.21 tags, number of tags in the video affect how long the video stays on trending list in a positive way. --> maintaining good amount (not too many, but good amount) of tags can positively work for one's video.
+
+fitting a model with the interaction term and high_tags
+```{r}
+
+video_fit3<-stan_glmer(trend_day_count~comment_count_scaled+tags_count_scaled*high_tags+(1|category_id),data=videodata1,cores=4)
+```
+
+```{r}
+plot(video_fit3, plotfun="trace",pars= c("(Intercept)","high_tagsTRUE","tags_count_scaled","tags_count_scaled:high_tagsTRUE","sigma"))
+```
+
+again, chains are good
+
+```{r}
+model_parameters(video_fit3, ci=0.9) 
+```
+
+Good Rhat value. (<1.01)
+again, tags_count_scaled:high_tagsTRUE has stronger pd than video_fit
+
+```{r}
+plot(video_fit3,plotfun="areas",pars=c("(Intercept)","high_tagsTRUE","tags_count_scaled","tags_count_scaled:high_tagsTRUE","sigma"),prob=0.9)
+
+```
+
+tags_count_scaled:high_tagsTRUE has negative parameter.
+When number of tags is greater than the mean of it (19.21), number of tags negatively affects the response variable which is trending days count.
+This indicates that if a Youtube video has too many tags (greater than 19 tags), number of tags start to negatively affects on how many days the video is on trending.
+
+
+Hyun Jin Ku
